@@ -1,0 +1,11 @@
+glob:*.suo
+glob:*.user
+glob:*.*~
+glob:*.dll
+glob:*.pdb
+glob:*obj/Debug*
+glob:*obj/Release*
+glob:*.swp
+syntax: glob
+*/bin/*
+*.cache
