@@ -8,4 +8,5 @@ glob:*obj/Release*
 glob:*.swp
 syntax: glob
 */bin/*
+*/obj/*
 *.cache
