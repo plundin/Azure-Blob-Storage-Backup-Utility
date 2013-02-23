@@ -381,7 +381,11 @@ namespace AzureBlobBackup
             List<string> include = options.Include;
             List<string> exclude = options.Exclude;
 
-            // Console.SetBufferSize(200, Console.BufferHeight);
+            try
+            {
+                Console.SetBufferSize(200, Console.BufferHeight);
+            }
+            catch { }
 
             int no = 0;
 
@@ -423,7 +427,11 @@ namespace AzureBlobBackup
             List<string> include = options.Include;
             List<string> exclude = options.Exclude;
 
-            Console.SetBufferSize(200, Console.BufferHeight);
+            try
+            {
+                Console.SetBufferSize(200, Console.BufferHeight);
+            }
+            catch { }
 
             int no = 0;
 
