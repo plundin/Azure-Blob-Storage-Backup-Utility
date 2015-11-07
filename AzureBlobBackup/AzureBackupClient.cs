@@ -9,16 +9,14 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
-using System.Text;
 using System.IO;
 using System.Configuration;
 using System.Threading;
 using System.Threading.Tasks;
-using System.Collections.Concurrent;
-
-using Microsoft.WindowsAzure;
-using Microsoft.WindowsAzure.StorageClient;
-using Microsoft.WindowsAzure.StorageClient.Protocol;
+using Microsoft.WindowsAzure.Storage;
+using Microsoft.Azure;
+using Microsoft.WindowsAzure.Storage.Blob;
+using Microsoft.WindowsAzure.Storage.RetryPolicies;
 
 namespace AzureBlobBackup
 {
@@ -28,22 +26,20 @@ namespace AzureBlobBackup
     public class AzureBackupClient
     {
         // Set to minimum upload and download speeds from config
-        private readonly float downloadSpeed, uploadSpeed;
-        // Represents upload or download direction
-        private enum Direction { Up, Down };
-       
+        private int maxRetryCount;
+
         /// <summary>
         /// Constructs the AzureBackupClient using the options from the BackupOptions instance.
         /// </summary>
         /// <param name="options">Options to use such as the local path, cloud container and account info.</param>
         public AzureBackupClient()
         {
-            // This is so CloudStorageAccount.FromConfigurationSetting knows where to get config from
-            CloudStorageAccount.SetConfigurationSettingPublisher((configName, configSetter) => configSetter(System.Configuration.ConfigurationManager.AppSettings[configName]));
+            // Max retry count
+            Int32.TryParse(ConfigurationManager.AppSettings["MaxRetryCount"],
+                System.Globalization.NumberStyles.Integer,
+                System.Globalization.CultureInfo.InvariantCulture, out maxRetryCount);
 
-            // For approximating timeouts, better would be to calculate this during upload download and use the last speed calculated
-            downloadSpeed = Single.Parse(ConfigurationManager.AppSettings["DownloadSpeed"], System.Globalization.CultureInfo.InvariantCulture.NumberFormat);
-            uploadSpeed = Single.Parse(ConfigurationManager.AppSettings["UploadSpeed"], System.Globalization.CultureInfo.InvariantCulture.NumberFormat);
+            if (maxRetryCount < 0) maxRetryCount = 0;
 
             // Prevent sleep and hibernate by regularly informing Windows we are alive
             System.Timers.Timer pwr = new System.Timers.Timer() { Interval = 60000, Enabled = true };
@@ -70,11 +66,11 @@ namespace AzureBlobBackup
             // Cloud account from commandline or config file
             if (!String.IsNullOrEmpty(options.Account))
             {
-                account = CloudStorageAccount.Parse(options.Account);
+                account = CloudStorageAccount.Parse(CloudConfigurationManager.GetSetting(options.Account));
             }
             else
             {
-                account = CloudStorageAccount.FromConfigurationSetting("AccountConnectionString");
+                account = CloudStorageAccount.Parse(CloudConfigurationManager.GetSetting("AccountConnectionString"));
             }
 
             // Validate supported action
@@ -131,14 +127,14 @@ namespace AzureBlobBackup
             // Create the container if it does not exist.
             try
             {
-                if (container.CreateIfNotExist())
+                if (container.CreateIfNotExists())
                 {
                     BlobContainerPermissions permissions = container.GetPermissions();
                     permissions.PublicAccess = BlobContainerPublicAccessType.Off;
                     container.SetPermissions(permissions);
                 }
             }
-            catch {}
+            catch { }
 
             return container;
         }
@@ -160,31 +156,36 @@ namespace AzureBlobBackup
             int files = 0;
 
             Console.WriteLine("Backup started at {0} {1}", DateTime.Now.ToShortDateString(), DateTime.Now.ToLongTimeString());
- 
+
             // Get files to backup
             List<string> fileNames = Directory.GetFiles(sourcePath, "*", SearchOption.AllDirectories)     // List files
                 .Where(                                                                                   // Exclude, include file extensions
                    filename =>
                    {
-                        string ext = Path.GetExtension(filename);
-                        return !exclude.Contains(ext, StringComparer.OrdinalIgnoreCase) && (include.Count == 0 || include.Contains(ext, StringComparer.OrdinalIgnoreCase));
+                       string ext = Path.GetExtension(filename);
+                       return !exclude.Contains(ext, StringComparer.OrdinalIgnoreCase) && (include.Count == 0 || include.Contains(ext, StringComparer.OrdinalIgnoreCase));
                    }
                 ).ToList<string>();
 
             if (options.Verbose) Console.WriteLine("Backing up a total of {0} files", fileNames.Count);
 
-            // Backup files in parallel
-            Parallel.ForEach(
-               fileNames,                                                                                                           // Worker source
-               new ParallelOptions() { MaxDegreeOfParallelism = options.Threads },                                                  // Limit worker threads
-               () => new LocalState(){Counter = 0, Container = GetContainerReference(account.CreateCloudBlobClient(), options.DestinationContainer)}, // Local state per worker thread
-               (filename, state, local) =>                                                                                          // Body to execute in parallel
-               {
-                   if (BackupFile(local.Container, sourcePath, filename.Substring(sourcelen), overwrite, verbose)) local.Counter++;
-                   return local;
-               },
-               local => { Interlocked.Add(ref files, local.Counter); }
-            );
+            // Backup files
+            List<Task<bool>> tasks = new List<Task<bool>>();
+
+            foreach (string filename in fileNames)
+            {
+                var task = Task.Run(() => BackupFile(GetContainerReference(account.CreateCloudBlobClient(), options.DestinationContainer), sourcePath, filename.Substring(sourcelen), overwrite, verbose));
+                task.ContinueWith(t => { if (t.Result) Interlocked.Increment(ref files); }, TaskContinuationOptions.OnlyOnRanToCompletion);
+                tasks.Add(task);
+
+                if (tasks.Count >= options.Threads)
+                {
+                    Task.WaitAny(tasks.ToArray());
+                    tasks = tasks.Where(t => !(t.IsCompleted || t.IsFaulted || t.IsCanceled)).ToList();
+                }
+            }
+
+            Task.WaitAll(tasks.ToArray());
 
             Console.WriteLine("Backup completed at {0} {1} with {2} files uploaded", DateTime.Now.ToShortDateString(), DateTime.Now.ToLongTimeString(), files);
         }
@@ -195,50 +196,50 @@ namespace AzureBlobBackup
         /// <param name="container">The cloud container</param>
         /// <param name="rootPath">The local root path (directory path)</param>
         /// <param name="relativePath">The file path relative to the root path</param>
-        private bool BackupFile(CloudBlobContainer container, string rootPath, string relativePath, bool overwrite, bool verbose)
+        private async Task<bool> BackupFile(CloudBlobContainer container, string rootPath, string relativePath, bool overwrite, bool verbose)
         {
             try
             {
                 FileInfo fileInfo = new FileInfo(rootPath + relativePath);
                 if (verbose) Console.WriteLine("Backing up file {0} ({1:N0} kB): ", relativePath, fileInfo.Length / 1024);
 
-                CloudBlob blob = container.GetBlobReference(relativePath);
+                CloudBlockBlob blob = container.GetBlockBlobReference(relativePath);
 
                 if (!overwrite)
                 {
                     try
                     {
                         // Fetch attributes so we can get last modified date, this call actually throws exception if blob does not exist
-                        blob.FetchAttributes();             
-                        
+                        await blob.FetchAttributesAsync();
+
                         // No backup if not modified
-                        if (fileInfo.LastWriteTimeUtc <= blob.Properties.LastModifiedUtc)
+                        if (fileInfo.LastWriteTimeUtc <= blob.Properties.LastModified)
                         {
                             if (verbose) Console.WriteLine("File {0} unchanged, not uploaded", relativePath);
                             return false;
                         }
                     }
-                    catch(StorageClientException e) 
+                    catch (StorageException e)
                     {
-                        if (e.ErrorCode != StorageErrorCode.ResourceNotFound) throw e;
+                        if (e.RequestInformation.HttpStatusCode != 404) throw e;
                     }
                 }
 
                 blob.Properties.ContentType = MimeTypes.Mapping[Path.GetExtension(relativePath)];
 
                 BlobRequestOptions requestOptions = new BlobRequestOptions()
-                { 
-                    Timeout = CalcTimeout(fileInfo.Length, Direction.Up)
+                {
+
                 };
 
                 DateTime start = DateTime.Now;
                 using (FileStream fs = File.Open(rootPath + relativePath, FileMode.Open, FileAccess.Read))
                 {
-                    blob.UploadFromStream(fs, requestOptions);
+                    await blob.UploadFromStreamAsync(fs, null, requestOptions, null);
                 }
 
                 if (verbose) Console.WriteLine("File {0} uploaded at {1:N0} kB/s", relativePath, fileInfo.Length / 1024 / DateTime.Now.Subtract(start).TotalMilliseconds * 1000);
-  
+
                 return true;
             }
             catch (Exception ex)
@@ -259,38 +260,39 @@ namespace AzureBlobBackup
             List<string> include = options.Include;
             List<string> exclude = options.Exclude;
             bool verbose = options.Verbose;
-            Object lck = new Object();
             int restored = 0;
 
-            Console.WriteLine("Restore started at {0} {1}",DateTime.Now.ToShortDateString(),DateTime.Now.ToLongTimeString());
+            Console.WriteLine("Restore started at {0} {1}", DateTime.Now.ToShortDateString(), DateTime.Now.ToLongTimeString());
 
             CloudBlobContainer container = GetContainerReference(account.CreateCloudBlobClient(), options.DestinationContainer);
             if (!restorePath.EndsWith("\\")) restorePath += "\\";
-            
-            // Get blobs and restore in parallel
-            Parallel.ForEach(
-               container.ListBlobs(new BlobRequestOptions() { UseFlatBlobListing = true })
+
+            // Get blobs and restore
+            List<Task<bool>> tasks = new List<Task<bool>>();
+            foreach (var bp in container.ListBlobs(null, useFlatBlobListing: true)
                     .Where(
                         b =>
                         {
                             string ext = Path.GetExtension(((CloudBlob)b).Name);
                             return !exclude.Contains(ext, StringComparer.OrdinalIgnoreCase) && (include.Count == 0 || include.Contains(ext, StringComparer.OrdinalIgnoreCase));
-                        }
-                ),
-               new ParallelOptions() { MaxDegreeOfParallelism = options.Threads },
-               () => new LocalState(){Counter = 0, Client = account.CreateCloudBlobClient()},
-               (bp, state, local) =>
-               {
-                   // Blob instance using our separate worker client 
-                   CloudBlob blob = new CloudBlob(bp.Uri.ToString(), local.Client);
+                        }))
+            {
+                CloudBlockBlob blob = new CloudBlockBlob(bp.Uri, account.Credentials);
 
-                   // Send along size to avoid having to do another request for filling properties
-                   long length = ((CloudBlob)bp).Properties.Length;
-                   if (RestoreFile(blob, length, restorePath, verbose)) local.Counter++;
-                   return local;
-               },
-               local => { Interlocked.Add(ref restored, local.Counter); }
-            );
+                // Send along size to avoid having to do another request for filling properties
+                long length = ((CloudBlob)bp).Properties.Length;
+                var task = Task.Run(() => RestoreFile(blob, length, restorePath, verbose));
+                task.ContinueWith(t => { if (t.Result) Interlocked.Increment(ref restored); }, TaskContinuationOptions.OnlyOnRanToCompletion);
+                tasks.Add(task);
+
+                if (tasks.Count >= options.Threads)
+                {
+                    Task.WaitAny(tasks.ToArray());
+                    tasks = tasks.Where(t => !(t.IsCompleted || t.IsFaulted || t.IsCanceled)).ToList();
+                }
+            }
+
+            Task.WaitAll(tasks.ToArray());
 
             Console.WriteLine("Restore completed at {0} {1} with {2} blobs downloaded", DateTime.Now.ToShortDateString(), DateTime.Now.ToLongTimeString(), restored);
         }
@@ -302,12 +304,12 @@ namespace AzureBlobBackup
         /// <param name="length">The size of the blob in bytes</param>
         /// <param name="destination">The local destination path</param>
         /// <returns>True if it successfully downloaded and saved the blob, false otherwise</returns>
-        private bool RestoreFile(CloudBlob blob, long length, string destination, bool verbose)
+        private async Task<bool> RestoreFile(CloudBlob blob, long length, string destination, bool verbose)
         {
             try
             {
                 if (verbose) Console.WriteLine("Restoring blob {0} ({1} kB)", blob.Name, length / 1024);
-                
+
                 if (!Directory.Exists(Path.GetDirectoryName(destination + blob.Name)))
                 {
                     Directory.CreateDirectory(Path.GetDirectoryName(destination + blob.Name));
@@ -315,13 +317,13 @@ namespace AzureBlobBackup
 
                 BlobRequestOptions requestOptions = new BlobRequestOptions()
                 {
-                    Timeout = CalcTimeout(length, Direction.Down)
+                    RetryPolicy = new ExponentialRetry(TimeSpan.FromSeconds(5), maxRetryCount)
                 };
 
                 DateTime start = DateTime.Now;
                 using (FileStream fs = File.Open(destination + blob.Name, FileMode.Create))
                 {
-                    blob.DownloadToStream(fs, requestOptions);
+                    await blob.DownloadToStreamAsync(fs, null, requestOptions, null);
                 }
 
                 if (verbose) Console.WriteLine("Blob {0} downloaded at {1:N0} kB/s", blob.Name, length / 1024 / DateTime.Now.Subtract(start).TotalMilliseconds * 1000);
@@ -344,7 +346,7 @@ namespace AzureBlobBackup
         {
             CloudBlobContainer container = GetContainerReference(account.CreateCloudBlobClient(), options.DestinationContainer);
 
-            Console.WriteLine("This will delete the entire container ({0})", options.DestinationContainer); 
+            Console.WriteLine("This will delete the entire container ({0})", options.DestinationContainer);
             Console.WriteLine("Do you want to continue? [yes|no|n]: ");
 
             if (Console.ReadLine().Trim().ToLower() == "yes")
@@ -393,7 +395,7 @@ namespace AzureBlobBackup
 
             // enumerate all the blobs
             foreach (
-                CloudBlob bp in container.ListBlobs(new BlobRequestOptions() { UseFlatBlobListing = true })
+                CloudBlob bp in container.ListBlobs(null, useFlatBlobListing: true)
                 .Where(
                      b =>
                      {
@@ -405,11 +407,11 @@ namespace AzureBlobBackup
             {
                 Console.WriteLine(
                     String.Format("{0, -60}{1, 20}", // {2, 50}{3, 40}
-                        bp.Name, 
+                        bp.Name,
                         String.Format("{0} kB", bp.Properties.Length / 1024)
-                        // ,bp.Properties.LastModifiedUtc,
-                        // bp.Properties.ContentType, 
-                        // (!String.IsNullOrEmpty(bp.Properties.ContentMD5) ? String.Format("MD5:{0}", bp.Properties.ContentMD5) : "")
+                    // ,bp.Properties.LastModifiedUtc,
+                    // bp.Properties.ContentType, 
+                    // (!String.IsNullOrEmpty(bp.Properties.ContentMD5) ? String.Format("MD5:{0}", bp.Properties.ContentMD5) : "")
                     )
                 );
                 no++;
@@ -443,7 +445,7 @@ namespace AzureBlobBackup
                 Console.WriteLine(
                     String.Format("{0, -60}{1, 50}",
                         bp.Name,
-                        bp.Properties.LastModifiedUtc
+                        bp.Properties.LastModified
                     )
                 );
                 no++;
@@ -468,58 +470,41 @@ namespace AzureBlobBackup
             int files = 0;
 
             CloudBlobContainer container = GetContainerReference(account.CreateCloudBlobClient(), options.DestinationContainer);
-
-            Parallel.ForEach(
-               container.ListBlobs(new BlobRequestOptions() { UseFlatBlobListing = true })
+            List<Task> tasks = new List<Task>();
+            foreach (var bp in container.ListBlobs(null, useFlatBlobListing: true)
                     .Where(
                         b =>
                         {
                             string ext = Path.GetExtension(((CloudBlob)b).Name);
                             return !exclude.Contains(ext, StringComparer.OrdinalIgnoreCase) && (include.Count == 0 || include.Contains(ext, StringComparer.OrdinalIgnoreCase));
                         }
-                ),
-               new ParallelOptions() { MaxDegreeOfParallelism = options.Threads },
-               () => 0,
-               (bp, state, local) =>
-               {
-                   CloudBlob blob = (CloudBlob)bp;
-                   if (!File.Exists(sourcePath + blob.Name)) // File does not exist locally so delete it in the backup.
-                   {
-                       if (options.Verbose) Console.Write(" Backup of {0} ({1} kbytes) ", blob.Name, blob.Properties.Length / 1024);
+                ))
+            {
+                CloudBlob blob = (CloudBlob)bp;
+                if (!File.Exists(sourcePath + blob.Name)) // File does not exist locally so delete it in the backup.
+                {
+                    var task = blob.DeleteAsync();
 
-                       blob.Delete();
+                    task.ContinueWith(t =>
+                    {
+                        Interlocked.Increment(ref files);
+                        if (options.Verbose) Console.WriteLine("Backup of {0} ({1} kbytes) deleted", blob.Name, blob.Properties.Length / 1024);
+                    },
+                    TaskContinuationOptions.OnlyOnRanToCompletion);
 
-                       if (options.Verbose) Console.WriteLine(" deleted.");
-                       local++;
-                   }
+                    tasks.Add(task);
 
-                   return local;
-               },
-               local => { Interlocked.Add(ref files, local); }
-            );
+                    if (tasks.Count >= options.Threads)
+                    {
+                        Task.WaitAny(tasks.ToArray());
+                        tasks = tasks.Where(t => !(t.IsCompleted || t.IsFaulted || t.IsCanceled)).ToList();
+                    }
+                }
+            }
+
+            Task.WaitAll(tasks.ToArray());
 
             Console.WriteLine("{0} file(s) deleted from backup.", files);
-        }
-
-        /// <summary>
-        /// Calculates service timeout for a download or upload operation
-        /// </summary>
-        /// <param name="size">size of file in bytes</param>
-        /// <param name="direction">upload or download direction</param>
-        /// <returns>A timespan with the number of seconds calculated</returns>
-        private TimeSpan CalcTimeout(long size, Direction direction)
-        {
-            float speed;
-            double seconds;
-
-            if (direction == Direction.Up) speed = uploadSpeed;
-            else speed = downloadSpeed;
-
-            // Calculate theoretical time and multiply by 5 to be on the safe side.
-            seconds = Math.Round((size * 8) / (speed * 1024 * 1024) * 5);
-            if (seconds <= 0) seconds = 1;
-
-            return TimeSpan.FromSeconds(seconds);
         }
     }
 }
