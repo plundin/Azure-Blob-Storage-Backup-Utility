@@ -7,14 +7,6 @@
  * Released under the Microsoft Public License (Ms-PL) http://www.microsoft.com/en-us/openness/licenses.aspx
 */
 using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Text;
-using System.Collections.Specialized;
-using System.IO;
-using System.Configuration;
-using CommandLine;
-using CommandLine.Text;
 
 namespace AzureBlobBackup
 {
@@ -33,9 +25,7 @@ namespace AzureBlobBackup
             BackupOptions options = new BackupOptions();
 
             // Command line parser library http://commandline.codeplex.com/
-            ICommandLineParser parser = new CommandLineParser();
-
-            if (parser.ParseArguments(args, options))
+            if (CommandLine.Parser.Default.ParseArguments(args, options))
             {
                 try
                 {

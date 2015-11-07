@@ -7,7 +7,6 @@
  * 
  * Released under the Microsoft Public License (Ms-PL) http://www.microsoft.com/en-us/openness/licenses.aspx
 */
-using System;
 using System.Runtime.InteropServices;
 
 namespace AzureBlobBackup.Native
